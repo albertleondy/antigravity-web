@@ -37,3 +37,17 @@ services:
       - /:/host
       # Optional: Mount SSH keys for Host SSH execution mode
       - ~/.ssh:/root/.ssh:ro
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: antigravity-tailscale
+    restart: unless-stopped
+    network_mode: "service:antigravity-web"
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    command: tailscaled --statedir=/var/lib/tailscale --socket=/var/run/tailscale/tailscaled.sock
+    volumes:
+      - ./data/tailscale:/var/lib/tailscale

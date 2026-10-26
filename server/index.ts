@@ -263,12 +263,33 @@ app.patch('/api/sessions/:id', (req, res) => {
 });
 
 app.delete('/api/sessions/:id', (req, res) => {
+  const target = sessions.find((s) => s.id === req.params.id);
   const proc = activeProcesses.get(req.params.id);
   if (proc) {
     proc.kill('SIGTERM');
     activeProcesses.delete(req.params.id);
   }
+  if (target?.agyConversationId) {
+    const brainPath = path.join(AGY_DATA_DIR, 'brain', target.agyConversationId);
+    try {
+      if (fs.existsSync(brainPath)) {
+        fs.rmSync(brainPath, { recursive: true, force: true });
+      }
+    } catch {
+      // ignore cleanup errors
+    }
+  }
   sessions = sessions.filter((s) => s.id !== req.params.id);
+  saveSessions(sessions);
+  res.json({ ok: true });
+});
+
+app.delete('/api/sessions', (_req, res) => {
+  for (const [id, proc] of activeProcesses.entries()) {
+    proc.kill('SIGTERM');
+    activeProcesses.delete(id);
+  }
+  sessions = [];
   saveSessions(sessions);
   res.json({ ok: true });
 });

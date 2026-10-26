@@ -782,8 +782,8 @@ export function App() {
     }
   };
 
-  const deleteSession = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const deleteSession = async (id: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
     await apiFetch(`/api/sessions/${id}`, { method: 'DELETE' });
     const remaining = sessions.filter((s) => s.id !== id);
     setSessions(remaining);
@@ -795,6 +795,14 @@ export function App() {
         createNewSession();
       }
     }
+  };
+
+  const clearAllSessions = async () => {
+    if (!window.confirm('Delete all conversations?')) return;
+    await apiFetch('/api/sessions', { method: 'DELETE' });
+    setSessions([]);
+    setActiveSessionId(null);
+    await createNewSession();
   };
 
   const activeModelObj = models.find((m) => m.id === activeSession?.model);
@@ -831,8 +839,19 @@ export function App() {
       {/* Sessions List */}
       <ScrollArea className="flex-1 w-full min-w-0">
         <div className="p-2 w-full min-w-0 overflow-hidden">
-          <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-            Conversations
+          <div className="px-2 py-1 flex items-center justify-between">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+              Conversations ({sessions.length})
+            </span>
+            {sessions.length > 1 && (
+              <button
+                type="button"
+                onClick={clearAllSessions}
+                className="text-[10px] text-zinc-500 hover:text-rose-400 transition-colors cursor-pointer"
+              >
+                Clear all
+              </button>
+            )}
           </div>
           <div className="space-y-1 mt-1 w-full min-w-0">
             {sessions.map((s) => {
@@ -863,8 +882,9 @@ export function App() {
                   <Button
                     variant="ghost"
                     size="icon-sm"
+                    title="Delete conversation"
                     onClick={(e) => deleteSession(s.id, e)}
-                    className="size-7 shrink-0 opacity-100 lg:opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-rose-400"
+                    className="size-7 shrink-0 text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10"
                   >
                     <Trash2 className="size-3.5" />
                   </Button>
@@ -1309,6 +1329,17 @@ export function App() {
               >
                 <SlidersHorizontal className="size-3.5 text-indigo-400" />
                 <span className="hidden lg:inline">Session Config</span>
+              </Button>
+
+              {/* Delete Current Session Button */}
+              <Button
+                variant="outline"
+                size="icon-sm"
+                title="Delete Current Conversation"
+                onClick={() => deleteSession(activeSession.id)}
+                className="text-zinc-400 hover:text-rose-400 hover:border-rose-500/40"
+              >
+                <Trash2 className="size-4" />
               </Button>
 
               {/* Toggle Server Telemetry */}
