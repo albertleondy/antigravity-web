@@ -1,0 +1,39 @@
+services:
+  antigravity-web:
+    build: .
+    container_name: antigravity-web
+    restart: unless-stopped
+    privileged: true
+    pid: "host"
+    ports:
+      - "${DOCKER_PORT:-3002}:3001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - PORT=3001
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-admin}
+      - AGY_BIN=/usr/local/bin/agy
+      - AGY_DEFAULT_CWD=${AGY_DEFAULT_CWD:-/workspace}
+      - AGY_DATA_DIR=/root/.gemini/antigravity-cli
+      - AGY_EXEC_MODE=${AGY_EXEC_MODE:-local}
+      - SSH_HOST=${SSH_HOST:-host.docker.internal}
+      - SSH_PORT=${SSH_PORT:-22}
+      - SSH_USER=${SSH_USER:-root}
+      - SSH_KEY_PATH=/root/.ssh/id_rsa
+    volumes:
+      # Persist web UI chat history
+      - ./data:/app/data
+      # Mount Docker socket so Antigravity can manage all containers & compose stacks on the server
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount the host's agy binary into the container
+      - ${HOST_AGY_BIN:-~/.local/bin/agy}:/usr/local/bin/agy:ro
+      # Mount Antigravity CLI credentials & brain history from host
+      - ${HOST_GEMINI_DIR:-~/.gemini}:/root/.gemini
+      # Mount your server projects / compose directory into /workspace
+      - ${HOST_WORKSPACE_DIR:-..}:/workspace
+      # Mount /home so existing host paths (/home/albert/...) work identically inside the container
+      - /home:/home
+      # Optional: Mount host root at /host so Antigravity can inspect/edit host configs
+      - /:/host
+      # Optional: Mount SSH keys for Host SSH execution mode
+      - ~/.ssh:/root/.ssh:ro
