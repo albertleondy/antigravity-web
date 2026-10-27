@@ -392,6 +392,22 @@ const ChatMessageBubble = memo<{
 });
 ChatMessageBubble.displayName = 'ChatMessageBubble';
 
+const SLASH_COMMANDS = [
+  { cmd: '/usage', desc: 'View model quota usage and reset times', instant: true },
+  { cmd: '/credits', desc: 'Show remaining G1 credits and upgrade link', instant: true },
+  { cmd: '/help', desc: 'Show available Antigravity CLI commands', instant: true },
+  { cmd: '/skills', desc: 'List installed Antigravity skills', instant: true },
+  { cmd: '/agents', desc: 'List available custom subagents', instant: true },
+  { cmd: '/compact', desc: 'Compact and summarize conversation context', instant: false },
+  { cmd: '/plan', desc: 'Create a step-by-step plan before execution', instant: false },
+  { cmd: '/goal', desc: 'Run thoroughly until the goal is fully achieved', instant: false },
+  { cmd: '/boost', desc: 'Deep thinking, multi-perspective planning & verification', instant: false },
+  { cmd: '/config', desc: 'View Antigravity CLI settings', instant: true },
+  { cmd: '/permissions', desc: 'Inspect tool permission rules', instant: true },
+  { cmd: '/plugin', desc: 'List installed plugins', instant: true },
+  { cmd: '/changelog', desc: 'Show Antigravity CLI release notes', instant: true },
+];
+
 // Isolated Chat Input Bar component so typing has 0ms lag and doesn't re-render the parent App!
 const ChatPromptBar = memo<{
   isStreaming: boolean;
@@ -401,8 +417,15 @@ const ChatPromptBar = memo<{
 }>(({ isStreaming, onSend, onStop, mobileControls }) => {
   const [text, setText] = useState('');
 
-  const handleSubmit = () => {
-    const trimmed = text.trim();
+  const matchingSlashCommands = useMemo(() => {
+    const trimmed = text.trimStart();
+    if (!trimmed.startsWith('/') || trimmed.includes(' ')) return [];
+    const q = trimmed.toLowerCase();
+    return SLASH_COMMANDS.filter((item) => item.cmd.startsWith(q));
+  }, [text]);
+
+  const handleSubmit = (overrideText?: string) => {
+    const trimmed = (overrideText ?? text).trim();
     if (!trimmed || isStreaming) return;
     onSend(trimmed);
     setText('');
@@ -410,7 +433,38 @@ const ChatPromptBar = memo<{
 
   return (
     <div className="p-2.5 sm:p-4 border-t border-zinc-800/80 bg-zinc-900/30 pb-[max(0.65rem,env(safe-area-inset-bottom))]">
-      <div className="max-w-3xl mx-auto space-y-2">
+      <div className="max-w-3xl mx-auto space-y-2 relative">
+        {matchingSlashCommands.length > 0 && (
+          <div className="absolute bottom-full left-0 right-0 mb-2 rounded-xl border border-zinc-800 bg-zinc-950/95 shadow-2xl backdrop-blur-md p-1.5 max-h-56 overflow-y-auto z-30">
+            <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+              Antigravity Slash Commands
+            </div>
+            {matchingSlashCommands.map((item) => (
+              <button
+                key={item.cmd}
+                type="button"
+                onClick={() => {
+                  if (item.instant) {
+                    handleSubmit(item.cmd);
+                  } else {
+                    setText(`${item.cmd} `);
+                  }
+                }}
+                className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg text-left text-xs hover:bg-indigo-600/20 hover:text-indigo-200 transition-colors cursor-pointer"
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="font-mono font-semibold text-indigo-400 shrink-0">
+                    {item.cmd}
+                  </span>
+                  <span className="text-zinc-400 truncate">{item.desc}</span>
+                </div>
+                <Badge variant={item.instant ? 'secondary' : 'outline'} className="shrink-0">
+                  {item.instant ? 'Run' : 'Prompt'}
+                </Badge>
+              </button>
+            ))}
+          </div>
+        )}
         {mobileControls}
         <div className="relative flex items-end gap-2 rounded-2xl border border-zinc-800 bg-zinc-900/90 p-2 focus-within:border-indigo-500/70 transition-colors">
           <Textarea
@@ -423,7 +477,7 @@ const ChatPromptBar = memo<{
                 handleSubmit();
               }
             }}
-            placeholder="Ask Antigravity to manage Docker, check logs, update services..."
+            placeholder="Ask Antigravity or type /usage, /credits, /skills, /compact..."
             className="min-h-11 resize-none border-0 bg-transparent px-2 py-1 text-sm focus-visible:ring-0 max-h-36"
           />
           {isStreaming ? (
@@ -433,7 +487,7 @@ const ChatPromptBar = memo<{
           ) : (
             <Button
               size="icon"
-              onClick={handleSubmit}
+              onClick={() => handleSubmit()}
               disabled={!text.trim()}
               title="Send Command"
             >

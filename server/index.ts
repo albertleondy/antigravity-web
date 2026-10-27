@@ -1031,6 +1031,115 @@ function killSessionRunner(sessionId: string) {
   }
 }
 
+const CLI_DIRECT_SLASH_COMMANDS = new Set([
+  '/usage',
+  '/quota',
+  '/credits',
+  '/help',
+  '/skills',
+  '/agents',
+  '/config',
+  '/settings',
+  '/permissions',
+  '/hooks',
+  '/plugin',
+  '/plugins',
+  '/changelog',
+  '/model',
+  '/effort',
+]);
+
+function formatProgressBar(fraction: number, width = 12): string {
+  const clamped = Math.max(0, Math.min(1, fraction));
+  const filled = Math.round(clamped * width);
+  return '█'.repeat(filled) + '░'.repeat(width - filled);
+}
+
+function formatCliSlashCommandMarkdown(
+  rawPrompt: string,
+  cmdObj: { name?: string; data?: Record<string, any> } | undefined,
+  fallbackText: string
+): string {
+  const cmdName = cmdObj?.name || rawPrompt.trim().split(/\s+/)[0].replace(/^\//, '');
+  const data = cmdObj?.data;
+
+  if ((cmdName === 'usage' || cmdName === 'quota') && data && Array.isArray(data.groups)) {
+    const lines: string[] = [
+      '### 📊 Antigravity Model Quota & Usage (`/usage`)',
+      '',
+      '| Model Group | Quota Bucket | Remaining | Bar | Resets At |',
+      '| :--- | :--- | :--- | :--- | :--- |',
+    ];
+    const notes: string[] = [];
+
+    for (const group of data.groups) {
+      const buckets = Array.isArray(group.buckets) ? group.buckets : [];
+      for (const b of buckets) {
+        const frac = typeof b.remaining_fraction === 'number' ? b.remaining_fraction : 0;
+        const pct = `${Math.round(frac * 100)}%`;
+        const bar = `\`${formatProgressBar(frac)}\``;
+        const resetStr = b.reset_time
+          ? new Date(b.reset_time).toLocaleString()
+          : 'N/A';
+        lines.push(
+          `| **${group.name}** | ${b.name} | **${pct}** | ${bar} | ${resetStr} |`
+        );
+        if (b.description) {
+          notes.push(`- **${group.name} (${b.name})**: ${b.description}`);
+        }
+      }
+    }
+
+    if (notes.length > 0) {
+      lines.push('', '#### Refresh Details', ...notes);
+    }
+    if (data.description) {
+      lines.push('', `> ${data.description}`);
+    }
+    return lines.join('\n');
+  }
+
+  if (cmdName === 'credits' && data) {
+    return [
+      '### 💳 Antigravity G1 Credits (`/credits`)',
+      '',
+      `- **Remaining Credits**: \`${data.remaining_credits ?? 0}\``,
+      data.upgrade_uri
+        ? `- **Upgrade / Purchase**: [${data.upgrade_uri}](${data.upgrade_uri})`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  if (cmdName === 'skills' && data && Array.isArray(data.skills)) {
+    const lines = [
+      '### 🧩 Available Skills (`/skills`)',
+      '',
+      ...data.skills.map(
+        (s: any) =>
+          `- **\`${s.name}\`** ${s.builtin ? '*(built-in)*' : ''}: ${s.description}\n  - Path: \`${s.path}\``
+      ),
+    ];
+    return lines.join('\n');
+  }
+
+  if (fallbackText.trim()) {
+    const trimmed = fallbackText.trim();
+    if (trimmed.includes('\t')) {
+      const rows = trimmed.split('\n').map((r) => r.split('\t'));
+      const mdRows = rows.map((cols) => `| ${cols.map((c) => c.trim()).join(' | ')} |`);
+      const colCount = Math.max(...rows.map((r) => r.length));
+      const header = `| ${Array.from({ length: colCount }, (_, i) => `Col ${i + 1}`).join(' | ')} |`;
+      const sep = `| ${Array.from({ length: colCount }, () => ':---').join(' | ')} |`;
+      return `### \`${rawPrompt.trim()}\`\n\n${header}\n${sep}\n${mdRows.join('\n')}`;
+    }
+    return `### \`${rawPrompt.trim()}\`\n\n\`\`\`text\n${trimmed}\n\`\`\``;
+  }
+
+  return `Executed \`${rawPrompt.trim()}\`.`;
+}
+
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url || '', `http://${req.headers.host}`);
   const token = url.searchParams.get('token');
@@ -1095,6 +1204,90 @@ wss.on('connection', (ws, req) => {
         });
 
         const cwd = fs.existsSync(session.cwd) ? session.cwd : process.cwd();
+        const trimmedPrompt = prompt.trim();
+        const firstToken = trimmedPrompt.split(/\s+/)[0].toLowerCase();
+
+        // Handle CLI-answered slash commands (like /usage, /quota, /credits, /help, /skills, etc.)
+        // directly via a one-shot `agy -p` call so they work alongside --input-format stream-json!
+        if (CLI_DIRECT_SLASH_COMMANDS.has(firstToken)) {
+          const restTokens = trimmedPrompt.slice(firstToken.length).trim();
+
+          // If user typed `/effort high` or `/model gemini-4-argon-high`, also update session config
+          if (firstToken === '/effort' && /^(low|medium|high|xhigh|max)$/i.test(restTokens)) {
+            session.effort = restTokens.toLowerCase();
+            saveSessions(sessions);
+          } else if (firstToken === '/model' && restTokens && !restTokens.includes(' ')) {
+            session.model = restTokens;
+            saveSessions(sessions);
+          }
+
+          const cmdChild = spawn(
+            AGY_BIN,
+            ['-p', trimmedPrompt, '--output-format', 'stream-json'],
+            {
+              cwd,
+              env: { ...process.env, TERM: 'dumb', NO_COLOR: '1' },
+            }
+          );
+
+          let outBuf = '';
+          let errBuf = '';
+          cmdChild.stdout?.on('data', (chunk: Buffer) => {
+            outBuf += chunk.toString();
+          });
+          cmdChild.stderr?.on('data', (chunk: Buffer) => {
+            errBuf += chunk.toString();
+          });
+          cmdChild.on('close', () => {
+            let cmdObj: { name?: string; data?: Record<string, any> } | undefined;
+            let rawResp = '';
+            for (const line of outBuf.split('\n')) {
+              const t = line.trim();
+              if (!t) continue;
+              try {
+                const parsed = JSON.parse(t);
+                if (parsed.event === 'command_result' && parsed.command) {
+                  cmdObj = parsed.command;
+                } else if (parsed.event === 'result' && parsed.result) {
+                  if (!cmdObj && parsed.result.command) {
+                    cmdObj = parsed.result.command;
+                  }
+                  if (typeof parsed.result.response === 'string') {
+                    rawResp = parsed.result.response;
+                  }
+                }
+              } catch {
+                rawResp += t + '\n';
+              }
+            }
+
+            assistantMsg.content = formatCliSlashCommandMarkdown(
+              trimmedPrompt,
+              cmdObj,
+              rawResp || errBuf
+            );
+            session.updatedAt = new Date().toISOString();
+            saveSessions(sessions);
+
+            sendWs(ws, {
+              type: 'turn_result',
+              sessionId,
+              messageId: assistantMsgId,
+              message: assistantMsg,
+              conversationId: session.agyConversationId,
+            });
+            sendWs(ws, {
+              type: 'turn_complete',
+              sessionId,
+              messageId: assistantMsgId,
+              exitCode: 0,
+              message: assistantMsg,
+              conversationId: session.agyConversationId,
+            });
+          });
+          return;
+        }
+
         const desiredConfigKey = `${session.execMode}|${cwd}|${session.model || ''}|${session.effort || ''}`;
 
         let runner = persistentRunners.get(sessionId);
