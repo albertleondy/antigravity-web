@@ -574,6 +574,38 @@ export function App() {
           setSelectedTaskModal((prev) =>
             prev ? data.tasks.find((t) => t.id === prev.id) || prev : null
           );
+
+          // Sync any stopped/completed background task status into message toolCalls
+          const taskMap = new Map(data.tasks.map((t) => [t.id, t]));
+          if (taskMap.size > 0) {
+            setSessions((prev) =>
+              prev.map((s) => {
+                if (s.id !== targetId) return s;
+                let changed = false;
+                const nextMessages = s.messages.map((m) => {
+                  if (!m.toolCalls || m.toolCalls.length === 0) return m;
+                  let msgChanged = false;
+                  const nextTc = m.toolCalls.map((tc) => {
+                    if (tc.taskId && taskMap.has(tc.taskId)) {
+                      const liveTask = taskMap.get(tc.taskId)!;
+                      if (tc.status === 'running' && liveTask.status !== 'running') {
+                        msgChanged = true;
+                        changed = true;
+                        return {
+                          ...tc,
+                          status: liveTask.status,
+                          output: liveTask.logTail || tc.output,
+                        };
+                      }
+                    }
+                    return tc;
+                  });
+                  return msgChanged ? { ...m, toolCalls: nextTc } : m;
+                });
+                return changed ? { ...s, messages: nextMessages } : s;
+              })
+            );
+          }
         }
       } catch {
         // ignore
@@ -588,6 +620,17 @@ export function App() {
       fetchSessionArtifacts();
     },
     [apiFetch, fetchSessionArtifacts]
+  );
+
+  const stopTask = useCallback(
+    async (taskId: string) => {
+      if (!activeSessionId) return;
+      await apiFetch(`/api/sessions/${activeSessionId}/tasks/${taskId}/stop`, {
+        method: 'POST',
+      });
+      fetchSessionArtifacts(activeSessionId);
+    },
+    [apiFetch, activeSessionId, fetchSessionArtifacts]
   );
 
   useEffect(() => {
@@ -1422,7 +1465,7 @@ export function App() {
 
         {/* In-Chat Running Dev Servers, Background Tasks & Brain Artifacts Bar */}
         {(sessionArtifacts.processes.length > 0 ||
-          sessionArtifacts.tasks.length > 0 ||
+          sessionArtifacts.tasks.some((t) => t.status === 'running') ||
           sessionArtifacts.artifacts.length > 0) && (
           <div className="shrink-0 border-b border-zinc-800/80 bg-zinc-900/60 px-3 sm:px-4 py-2">
             <div className="max-w-3xl mx-auto flex items-center gap-2 overflow-x-auto no-scrollbar">
@@ -1457,32 +1500,35 @@ export function App() {
                 </div>
               ))}
 
-              {/* Background Tasks from AGY */}
-              {sessionArtifacts.tasks.map((task) => {
-                const isRunning = task.status === 'running';
-                return (
-                  <button
+              {/* Active Background Tasks from AGY */}
+              {sessionArtifacts.tasks
+                .filter((task) => task.status === 'running')
+                .map((task) => (
+                  <div
                     key={task.id}
-                    type="button"
-                    onClick={() => setSelectedTaskModal(task)}
-                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs shrink-0 transition-colors cursor-pointer ${
-                      isRunning
-                        ? 'bg-amber-950/40 border-amber-500/40 text-amber-200 hover:bg-amber-950/60'
-                        : 'bg-zinc-900 border-zinc-800 text-zinc-300 hover:bg-zinc-800'
-                    }`}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border bg-amber-950/40 border-amber-500/40 text-amber-200 text-xs shrink-0"
                   >
-                    <span
-                      className={`w-2 h-2 rounded-full shrink-0 ${
-                        isRunning ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'
-                      }`}
-                    />
-                    <span className="font-mono font-medium text-[11px]">{task.id}</span>
-                    <span className="font-mono text-[11px] text-zinc-400 max-w-[150px] truncate">
-                      {task.command}
-                    </span>
-                  </button>
-                );
-              })}
+                    <button
+                      type="button"
+                      onClick={() => setSelectedTaskModal(task)}
+                      className="inline-flex items-center gap-1.5 hover:opacity-80 transition-opacity cursor-pointer"
+                    >
+                      <span className="w-2 h-2 rounded-full shrink-0 bg-amber-400 animate-pulse" />
+                      <span className="font-mono font-medium text-[11px]">{task.id}</span>
+                      <span className="font-mono text-[11px] text-zinc-400 max-w-[150px] truncate">
+                        {task.command}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => stopTask(task.id)}
+                      title={`Stop ${task.id}`}
+                      className="ml-1 px-1.5 py-0.5 rounded bg-rose-500/20 hover:bg-rose-500/40 text-rose-300 text-[10px] font-medium transition-colors cursor-pointer"
+                    >
+                      Stop
+                    </button>
+                  </div>
+                ))}
 
               {/* Generated Brain Artifacts */}
               {sessionArtifacts.artifacts.map((art) => (
@@ -1740,6 +1786,16 @@ export function App() {
             </pre>
           </div>
           <DialogFooter>
+            {selectedTaskModal?.status === 'running' && (
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={() => stopTask(selectedTaskModal.id)}
+              >
+                <Square className="size-3.5" />
+                Stop Task
+              </Button>
+            )}
             <Button
               variant="outline"
               size="sm"

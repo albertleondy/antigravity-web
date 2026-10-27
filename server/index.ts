@@ -333,6 +333,8 @@ function cleanTerminalLog(raw: string, maxChars = 4000): string {
   return lines.slice(-80).join('\n').slice(-maxChars);
 }
 
+const stoppedTaskIds = new Set<string>();
+
 function getConversationTasksAndArtifacts(conversationId?: string): {
   tasks: BackgroundTaskItem[];
   artifacts: BrainArtifactItem[];
@@ -362,7 +364,7 @@ function getConversationTasksAndArtifacts(conversationId?: string): {
           tasksMap.set(taskId, {
             id: taskId,
             command: descMatch ? descMatch[1].trim() : taskId,
-            status: 'running',
+            status: stoppedTaskIds.has(`${conversationId}/${taskId}`) ? 'done' : 'running',
             logTail: '',
             updatedAt: entry.created_at || new Date().toISOString(),
           });
@@ -379,6 +381,49 @@ function getConversationTasksAndArtifacts(conversationId?: string): {
           if (existing) {
             existing.status = exitCode === 0 ? 'done' : 'error';
             existing.updatedAt = entry.created_at || existing.updatedAt;
+          }
+        }
+
+        // Detect background task cancellation / kill in SYSTEM_MESSAGE or tool output
+        const cancelMatches = [
+          ...content.matchAll(
+            /Task id "[^"]+\/(task-\d+)"\s+(?:was canceled|was cancelled|was killed|terminated|stopped)/gi
+          ),
+        ];
+        for (const cm of cancelMatches) {
+          const existing = tasksMap.get(cm[1]);
+          if (existing) {
+            existing.status = 'done';
+            existing.updatedAt = entry.created_at || existing.updatedAt;
+          }
+        }
+
+        // Detect manage_task list reporting no running tasks
+        if (content.includes('No background tasks are currently running')) {
+          for (const item of tasksMap.values()) {
+            if (item.status === 'running') {
+              item.status = 'done';
+              item.updatedAt = entry.created_at || item.updatedAt;
+            }
+          }
+        }
+
+        // Detect manage_task kill tool call
+        if (Array.isArray(entry.tool_calls)) {
+          for (const tc of entry.tool_calls) {
+            const tcName = tc.name || tc.tool_name || '';
+            const tcArgs = tc.args || tc.arguments || {};
+            const action = String(tcArgs.Action || '').replace(/^"|"$/g, '');
+            const rawTaskId = String(tcArgs.TaskId || '').replace(/^"|"$/g, '');
+            if (tcName === 'manage_task' && action === 'kill' && rawTaskId) {
+              const m = rawTaskId.match(/(task-\d+)/);
+              if (m) {
+                const existing = tasksMap.get(m[1]);
+                if (existing) {
+                  existing.status = 'done';
+                }
+              }
+            }
           }
         }
       }
@@ -522,6 +567,83 @@ async function detectRunningDevProcesses(): Promise<RunningProcessItem[]> {
   }
 }
 
+async function hasLiveRunnerChildProcesses(sessionId: string): Promise<boolean> {
+  const runner = persistentRunners.get(sessionId);
+  const rootPid = runner?.child?.pid;
+  if (!rootPid) return false;
+  try {
+    const { stdout } = await execAsync('ps -eo pid,ppid --no-headers');
+    for (const line of stdout.split('\n')) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+      if (m && Number(m[2]) === rootPid) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function killProcessTree(targetPid: number) {
+  try {
+    const { stdout } = await execAsync('ps -eo pid,ppid --no-headers');
+    const childrenMap = new Map<number, number[]>();
+    const parentMap = new Map<number, number>();
+    for (const line of stdout.split('\n')) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+      if (!m) continue;
+      const p = Number(m[1]);
+      const pp = Number(m[2]);
+      parentMap.set(p, pp);
+      if (!childrenMap.has(pp)) childrenMap.set(pp, []);
+      childrenMap.get(pp)!.push(p);
+    }
+
+    const toKill = new Set<number>([targetPid]);
+    const queue = [targetPid];
+    while (queue.length > 0) {
+      const curr = queue.shift()!;
+      for (const child of childrenMap.get(curr) || []) {
+        if (!toKill.has(child)) {
+          toKill.add(child);
+          queue.push(child);
+        }
+      }
+    }
+
+    // Also climb up to any intermediate shell wrapper spawned by a persistent agy runner
+    const runnerPids = new Set<number>();
+    for (const r of persistentRunners.values()) {
+      if (r.child.pid) runnerPids.add(r.child.pid);
+    }
+    let anc = parentMap.get(targetPid);
+    const ancestors: number[] = [];
+    while (anc && anc > 1 && anc !== process.pid) {
+      if (runnerPids.has(anc)) {
+        for (const a of ancestors) toKill.add(a);
+        break;
+      }
+      ancestors.push(anc);
+      anc = parentMap.get(anc);
+    }
+
+    for (const p of Array.from(toKill).reverse()) {
+      try {
+        process.kill(p, 'SIGTERM');
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    try {
+      process.kill(targetPid, 'SIGTERM');
+    } catch {
+      // ignore
+    }
+  }
+}
+
 // Get running tasks, artifacts, and dev server processes for a session
 app.get('/api/sessions/:id/artifacts', async (req, res) => {
   const session = sessions.find((s) => s.id === req.params.id);
@@ -529,6 +651,37 @@ app.get('/api/sessions/:id/artifacts', async (req, res) => {
 
   const { tasks, artifacts } = getConversationTasksAndArtifacts(session.agyConversationId);
   const processes = await detectRunningDevProcesses();
+  const hasRunnerChildren = await hasLiveRunnerChildProcesses(session.id);
+
+  // If the session's agy runner has no child processes and no dev processes are running,
+  // any background task still marked 'running' in transcript history has already stopped.
+  if (!hasRunnerChildren && processes.length === 0) {
+    for (const t of tasks) {
+      if (t.status === 'running') {
+        t.status = 'done';
+      }
+    }
+  }
+
+  // Reconcile saved toolCalls statuses in session.messages with live task status
+  const taskStatusMap = new Map(tasks.map((t) => [t.id, t.status]));
+  let sessionChanged = false;
+  for (const msg of session.messages) {
+    if (Array.isArray(msg.toolCalls)) {
+      for (const tc of msg.toolCalls) {
+        if (tc.taskId && taskStatusMap.has(tc.taskId)) {
+          const liveStatus = taskStatusMap.get(tc.taskId)!;
+          if (tc.status === 'running' && liveStatus !== 'running') {
+            tc.status = liveStatus;
+            sessionChanged = true;
+          }
+        }
+      }
+    }
+  }
+  if (sessionChanged) {
+    saveSessions(sessions);
+  }
 
   res.json({
     tasks,
@@ -538,17 +691,46 @@ app.get('/api/sessions/:id/artifacts', async (req, res) => {
 });
 
 // Stop/kill a running background dev server process by PID
-app.post('/api/processes/:pid/kill', (req, res) => {
+app.post('/api/processes/:pid/kill', async (req, res) => {
   const pid = Number(req.params.pid);
   if (!pid || pid === process.pid) {
     return res.status(400).json({ error: 'Invalid PID' });
   }
   try {
-    process.kill(pid, 'SIGTERM');
+    await killProcessTree(pid);
     return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: String(err) });
   }
+});
+
+// Stop/kill a background task for a session
+app.post('/api/sessions/:id/tasks/:taskId/stop', async (req, res) => {
+  const session = sessions.find((s) => s.id === req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+
+  const { taskId } = req.params;
+  if (session.agyConversationId) {
+    stoppedTaskIds.add(`${session.agyConversationId}/${taskId}`);
+  }
+
+  const runner = persistentRunners.get(session.id);
+  const rootPid = runner?.child?.pid;
+  if (rootPid) {
+    try {
+      const { stdout } = await execAsync('ps -eo pid,ppid --no-headers');
+      for (const line of stdout.split('\n')) {
+        const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+        if (m && Number(m[2]) === rootPid) {
+          await killProcessTree(Number(m[1]));
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return res.json({ ok: true });
 });
 
 // Live Server & Docker Telemetry
@@ -769,14 +951,20 @@ function readCurrentTurnTranscriptToolCalls(
           }
         }
 
-        // Check if a later SYSTEM_MESSAGE marked this background task as finished
+        // Check if a later SYSTEM_MESSAGE or manage_task marked this background task as finished/canceled
         let bgFinished = false;
         if (taskId) {
-          bgFinished = relevantEntries.some(
-            (e) =>
-              typeof e.content === 'string' &&
-              e.content.includes(`/${taskId}" finished with result:`)
-          );
+          bgFinished =
+            stoppedTaskIds.has(`${conversationId}/${taskId}`) ||
+            relevantEntries.some(
+              (e) =>
+                typeof e.content === 'string' &&
+                (e.content.includes(`/${taskId}" finished with result:`) ||
+                  e.content.includes(`/${taskId}" was canceled`) ||
+                  e.content.includes(`/${taskId}" was cancelled`) ||
+                  e.content.includes(`/${taskId}" was killed`) ||
+                  e.content.includes('No background tasks are currently running'))
+            );
         }
 
         for (const tc of entry.tool_calls) {
