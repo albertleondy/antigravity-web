@@ -289,11 +289,7 @@ app.patch('/api/sessions/:id', (req, res) => {
 
 app.delete('/api/sessions/:id', (req, res) => {
   const target = sessions.find((s) => s.id === req.params.id);
-  const proc = activeProcesses.get(req.params.id);
-  if (proc) {
-    proc.kill('SIGTERM');
-    activeProcesses.delete(req.params.id);
-  }
+  killSessionRunner(req.params.id);
   if (target?.agyConversationId) {
     const brainPath = path.join(AGY_DATA_DIR, 'brain', target.agyConversationId);
     try {
@@ -310,9 +306,8 @@ app.delete('/api/sessions/:id', (req, res) => {
 });
 
 app.delete('/api/sessions', (_req, res) => {
-  for (const [id, proc] of activeProcesses.entries()) {
-    proc.kill('SIGTERM');
-    activeProcesses.delete(id);
+  for (const id of [...activeProcesses.keys(), ...persistentRunners.keys()]) {
+    killSessionRunner(id);
   }
   sessions = [];
   saveSessions(sessions);
@@ -321,20 +316,19 @@ app.delete('/api/sessions', (_req, res) => {
 
 // Stop active agy run for a session
 app.post('/api/sessions/:id/stop', (req, res) => {
-  const proc = activeProcesses.get(req.params.id);
-  if (proc) {
-    proc.kill('SIGTERM');
-    activeProcesses.delete(req.params.id);
-    return res.json({ stopped: true });
-  }
-  res.json({ stopped: false });
+  const hadProcess =
+    activeProcesses.has(req.params.id) || persistentRunners.has(req.params.id);
+  killSessionRunner(req.params.id);
+  res.json({ stopped: hadProcess });
 });
 
 function cleanTerminalLog(raw: string, maxChars = 4000): string {
-  const stripped = raw.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+  const stripped = raw
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+    .replace(/\r\n/g, '\n');
   const lines = stripped
     .split('\n')
-    .map((l) => l.split('\r').pop() || '')
+    .map((l) => (l.includes('\r') ? l.split('\r').filter(Boolean).pop() || '' : l))
     .filter((l, i, arr) => l.trim() !== '' || (i > 0 && arr[i - 1].trim() !== ''));
   return lines.slice(-80).join('\n').slice(-maxChars);
 }
@@ -818,6 +812,37 @@ function readCurrentTurnTranscriptToolCalls(
   }
 }
 
+interface PersistentSessionRunner {
+  child: ChildProcess;
+  configKey: string;
+  onJsonLine?: (line: string) => void;
+  onStderr?: (text: string) => void;
+  onClose?: (code: number | null) => void;
+}
+
+const persistentRunners = new Map<string, PersistentSessionRunner>();
+
+function killSessionRunner(sessionId: string) {
+  const runner = persistentRunners.get(sessionId);
+  if (runner) {
+    try {
+      runner.child.kill('SIGTERM');
+    } catch {
+      // ignore
+    }
+    persistentRunners.delete(sessionId);
+  }
+  const proc = activeProcesses.get(sessionId);
+  if (proc) {
+    try {
+      proc.kill('SIGTERM');
+    } catch {
+      // ignore
+    }
+    activeProcesses.delete(sessionId);
+  }
+}
+
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url || '', `http://${req.headers.host}`);
   const token = url.searchParams.get('token');
@@ -832,12 +857,8 @@ wss.on('connection', (ws, req) => {
       const msg = JSON.parse(rawData.toString());
 
       if (msg.type === 'stop' && msg.sessionId) {
-        const proc = activeProcesses.get(msg.sessionId);
-        if (proc) {
-          proc.kill('SIGTERM');
-          activeProcesses.delete(msg.sessionId);
-          sendWs(ws, { type: 'stopped', sessionId: msg.sessionId });
-        }
+        killSessionRunner(msg.sessionId);
+        sendWs(ws, { type: 'stopped', sessionId: msg.sessionId });
         return;
       }
 
@@ -847,13 +868,6 @@ wss.on('connection', (ws, req) => {
         if (!session || !prompt?.trim()) {
           sendWs(ws, { type: 'error', error: 'Invalid session or empty prompt' });
           return;
-        }
-
-        // Kill any existing run for this session
-        const existing = activeProcesses.get(sessionId);
-        if (existing) {
-          existing.kill('SIGTERM');
-          activeProcesses.delete(sessionId);
         }
 
         // Save user message
@@ -892,57 +906,118 @@ wss.on('connection', (ws, req) => {
           sessionTitle: session.title,
         });
 
-        // Build agy arguments
-        const agyArgs: string[] = [
-          '-p',
-          prompt,
-          '--output-format',
-          'stream-json',
-          '--dangerously-skip-permissions',
-        ];
-
-        if (session.agyConversationId) {
-          agyArgs.push('--conversation', session.agyConversationId);
-        }
-        if (session.model && session.model.trim()) {
-          agyArgs.push('--model', session.model.trim());
-        }
-        if (session.effort && session.effort.trim()) {
-          agyArgs.push('--effort', session.effort.trim());
-        }
-
         const cwd = fs.existsSync(session.cwd) ? session.cwd : process.cwd();
-        let child: ChildProcess;
+        const desiredConfigKey = `${session.execMode}|${cwd}|${session.model || ''}|${session.effort || ''}`;
 
-        if (session.execMode === 'ssh') {
-          const sshArgs: string[] = ['-o', 'StrictHostKeyChecking=no', '-p', String(SSH_PORT)];
-          if (SSH_KEY_PATH && fs.existsSync(SSH_KEY_PATH)) {
-            sshArgs.push('-i', SSH_KEY_PATH);
-          }
-          const escapedAgyArgs = agyArgs
-            .map((a) => `'${a.replace(/'/g, `'\\''`)}'`)
-            .join(' ');
-          const remoteCmd = `cd '${cwd.replace(/'/g, `'\\''`)}' && ${AGY_BIN} ${escapedAgyArgs}`;
-          sshArgs.push(`${SSH_USER}@${SSH_HOST}`, remoteCmd);
-
-          child = spawn('ssh', sshArgs, {
-            env: { ...process.env },
-          });
-        } else {
-          child = spawn(AGY_BIN, agyArgs, {
-            cwd,
-            env: { ...process.env },
-          });
+        let runner = persistentRunners.get(sessionId);
+        if (
+          runner &&
+          (runner.child.killed ||
+            runner.child.exitCode !== null ||
+            runner.configKey !== desiredConfigKey)
+        ) {
+          killSessionRunner(sessionId);
+          runner = undefined;
         }
 
-        activeProcesses.set(sessionId, child);
+        if (!runner) {
+          // Spawn persistent stream-json agy process so background tasks (e.g. npm run dev) stay alive across turns!
+          const agyArgs: string[] = [
+            '-p=',
+            '--input-format',
+            'stream-json',
+            '--output-format',
+            'stream-json',
+            '--dangerously-skip-permissions',
+          ];
+
+          if (session.agyConversationId) {
+            agyArgs.push('--conversation', session.agyConversationId);
+          }
+          if (session.model && session.model.trim()) {
+            agyArgs.push('--model', session.model.trim());
+          }
+          if (session.effort && session.effort.trim()) {
+            agyArgs.push('--effort', session.effort.trim());
+          }
+
+          let child: ChildProcess;
+          if (session.execMode === 'ssh') {
+            const sshArgs: string[] = ['-o', 'StrictHostKeyChecking=no', '-p', String(SSH_PORT)];
+            if (SSH_KEY_PATH && fs.existsSync(SSH_KEY_PATH)) {
+              sshArgs.push('-i', SSH_KEY_PATH);
+            }
+            const escapedAgyArgs = agyArgs
+              .map((a) => `'${a.replace(/'/g, `'\\''`)}'`)
+              .join(' ');
+            const remoteCmd = `cd '${cwd.replace(/'/g, `'\\''`)}' && ${AGY_BIN} ${escapedAgyArgs}`;
+            sshArgs.push(`${SSH_USER}@${SSH_HOST}`, remoteCmd);
+
+            child = spawn('ssh', sshArgs, {
+              env: { ...process.env },
+              stdio: ['pipe', 'pipe', 'pipe'],
+            });
+          } else {
+            child = spawn(AGY_BIN, agyArgs, {
+              cwd,
+              env: { ...process.env },
+              stdio: ['pipe', 'pipe', 'pipe'],
+            });
+          }
+
+          const newRunner: PersistentSessionRunner = {
+            child,
+            configKey: desiredConfigKey,
+          };
+
+          let stdoutBuffer = '';
+          child.stdout?.on('data', (chunk: Buffer) => {
+            stdoutBuffer += chunk.toString();
+            const lines = stdoutBuffer.split('\n');
+            stdoutBuffer = lines.pop() || '';
+            for (const line of lines) {
+              newRunner.onJsonLine?.(line);
+            }
+          });
+
+          child.stderr?.on('data', (chunk: Buffer) => {
+            newRunner.onStderr?.(chunk.toString());
+          });
+
+          child.on('close', (code) => {
+            if (stdoutBuffer.trim()) {
+              newRunner.onJsonLine?.(stdoutBuffer);
+              stdoutBuffer = '';
+            }
+            persistentRunners.delete(sessionId);
+            activeProcesses.delete(sessionId);
+            newRunner.onClose?.(code);
+          });
+
+          child.on('error', (err) => {
+            persistentRunners.delete(sessionId);
+            activeProcesses.delete(sessionId);
+            assistantMsg.error = `Failed to launch Antigravity CLI (${AGY_BIN}): ${err.message}`;
+            saveSessions(sessions);
+            sendWs(ws, {
+              type: 'turn_error',
+              sessionId,
+              messageId: assistantMsgId,
+              error: assistantMsg.error,
+            });
+          });
+
+          persistentRunners.set(sessionId, newRunner);
+          activeProcesses.set(sessionId, child);
+          runner = newRunner;
+        }
 
         const initialTranscriptLines = getTranscriptLineCount(session.agyConversationId);
         let currentTurnUserStepIndex = -1;
-        let stdoutBuffer = '';
         let stderrBuffer = '';
+        let turnCompleted = false;
 
-        const handleJsonLine = (line: string) => {
+        runner.onJsonLine = (line: string) => {
           const trimmed = line.trim();
           if (!trimmed) return;
 
@@ -1075,6 +1150,9 @@ wss.on('connection', (ws, req) => {
               if (!assistantMsg.content && typeof res.response === 'string') {
                 assistantMsg.content = res.response;
               }
+              if (res.error && !assistantMsg.content) {
+                assistantMsg.error = res.error;
+              }
               if (res.duration_seconds) {
                 assistantMsg.durationSeconds = res.duration_seconds;
               }
@@ -1091,11 +1169,22 @@ wss.on('connection', (ws, req) => {
                   assistantMsg.toolCalls = transcriptTools;
                 }
               }
+              turnCompleted = true;
+              session.updatedAt = new Date().toISOString();
               saveSessions(sessions);
+
               sendWs(ws, {
                 type: 'turn_result',
                 sessionId,
                 messageId: assistantMsgId,
+                message: assistantMsg,
+                conversationId: session.agyConversationId,
+              });
+              sendWs(ws, {
+                type: 'turn_complete',
+                sessionId,
+                messageId: assistantMsgId,
+                exitCode: 0,
                 message: assistantMsg,
                 conversationId: session.agyConversationId,
               });
@@ -1113,17 +1202,7 @@ wss.on('connection', (ws, req) => {
           }
         };
 
-        child.stdout?.on('data', (chunk: Buffer) => {
-          stdoutBuffer += chunk.toString();
-          const lines = stdoutBuffer.split('\n');
-          stdoutBuffer = lines.pop() || '';
-          for (const line of lines) {
-            handleJsonLine(line);
-          }
-        });
-
-        child.stderr?.on('data', (chunk: Buffer) => {
-          const text = chunk.toString();
+        runner.onStderr = (text: string) => {
           stderrBuffer += text;
           sendWs(ws, {
             type: 'stderr_log',
@@ -1131,26 +1210,10 @@ wss.on('connection', (ws, req) => {
             messageId: assistantMsgId,
             text,
           });
-        });
+        };
 
-        child.on('error', (err) => {
-          activeProcesses.delete(sessionId);
-          assistantMsg.error = `Failed to launch Antigravity CLI (${AGY_BIN}): ${err.message}`;
-          saveSessions(sessions);
-          sendWs(ws, {
-            type: 'turn_error',
-            sessionId,
-            messageId: assistantMsgId,
-            error: assistantMsg.error,
-          });
-        });
-
-        child.on('close', (code) => {
-          if (stdoutBuffer.trim()) {
-            handleJsonLine(stdoutBuffer);
-          }
-          activeProcesses.delete(sessionId);
-
+        runner.onClose = (code: number | null) => {
+          if (turnCompleted) return;
           if (code !== 0 && code !== null && !assistantMsg.content) {
             assistantMsg.error =
               stderrBuffer.trim() || `Antigravity CLI exited with code ${code}`;
@@ -1166,7 +1229,14 @@ wss.on('connection', (ws, req) => {
             message: assistantMsg,
             conversationId: session.agyConversationId,
           });
+        };
+
+        // Send user turn as NDJSON over stdin to the persistent agy process
+        const ndjsonInput = JSON.stringify({
+          event: 'user',
+          message: { content: prompt },
         });
+        runner.child.stdin?.write(ndjsonInput + '\n');
       }
     } catch (err) {
       sendWs(ws, { type: 'error', error: String(err) });
