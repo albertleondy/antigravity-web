@@ -10,6 +10,37 @@ export interface ToolCallItem {
   args?: Record<string, unknown>;
   status: 'running' | 'done' | 'error';
   output?: string;
+  taskId?: string;
+}
+
+export interface BackgroundTaskItem {
+  id: string;
+  command: string;
+  status: 'running' | 'done' | 'error';
+  logTail: string;
+  updatedAt: string;
+}
+
+export interface BrainArtifactItem {
+  name: string;
+  relativePath: string;
+  content: string;
+  sizeBytes: number;
+  updatedAt: string;
+}
+
+export interface RunningProcessItem {
+  pid: number;
+  command: string;
+  cwd: string;
+  elapsedSeconds: number;
+  ports: number[];
+}
+
+export interface SessionArtifactsResponse {
+  tasks: BackgroundTaskItem[];
+  artifacts: BrainArtifactItem[];
+  processes: RunningProcessItem[];
 }
 
 export interface ChatMessage {

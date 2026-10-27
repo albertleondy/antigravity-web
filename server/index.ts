@@ -101,6 +101,31 @@ export interface ToolCallItem {
   args?: Record<string, unknown>;
   status: 'running' | 'done' | 'error';
   output?: string;
+  taskId?: string;
+}
+
+export interface BackgroundTaskItem {
+  id: string;
+  command: string;
+  status: 'running' | 'done' | 'error';
+  logTail: string;
+  updatedAt: string;
+}
+
+export interface BrainArtifactItem {
+  name: string;
+  relativePath: string;
+  content: string;
+  sizeBytes: number;
+  updatedAt: string;
+}
+
+export interface RunningProcessItem {
+  pid: number;
+  command: string;
+  cwd: string;
+  elapsedSeconds: number;
+  ports: number[];
 }
 
 export interface ChatMessage {
@@ -305,6 +330,233 @@ app.post('/api/sessions/:id/stop', (req, res) => {
   res.json({ stopped: false });
 });
 
+function cleanTerminalLog(raw: string, maxChars = 4000): string {
+  const stripped = raw.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+  const lines = stripped
+    .split('\n')
+    .map((l) => l.split('\r').pop() || '')
+    .filter((l, i, arr) => l.trim() !== '' || (i > 0 && arr[i - 1].trim() !== ''));
+  return lines.slice(-80).join('\n').slice(-maxChars);
+}
+
+function getConversationTasksAndArtifacts(conversationId?: string): {
+  tasks: BackgroundTaskItem[];
+  artifacts: BrainArtifactItem[];
+} {
+  if (!conversationId) return { tasks: [], artifacts: [] };
+  const brainDir = path.join(AGY_DATA_DIR, 'brain', conversationId);
+  if (!fs.existsSync(brainDir)) return { tasks: [], artifacts: [] };
+
+  const tasksMap = new Map<string, BackgroundTaskItem>();
+  const transcriptPath = path.join(brainDir, '.system_generated', 'logs', 'transcript.jsonl');
+
+  if (fs.existsSync(transcriptPath)) {
+    try {
+      const lines = fs.readFileSync(transcriptPath, 'utf-8').trim().split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const entry = JSON.parse(line);
+        const content = typeof entry.content === 'string' ? entry.content : '';
+
+        // Detect background task launch
+        const launchMatch = content.match(
+          /Tool is running as a background task with task id:\s*[^\s/]+\/(task-\d+)/
+        );
+        if (launchMatch) {
+          const taskId = launchMatch[1];
+          const descMatch = content.match(/Task Description:\s*(.+)/);
+          tasksMap.set(taskId, {
+            id: taskId,
+            command: descMatch ? descMatch[1].trim() : taskId,
+            status: 'running',
+            logTail: '',
+            updatedAt: entry.created_at || new Date().toISOString(),
+          });
+        }
+
+        // Detect background task completion in SYSTEM_MESSAGE
+        const finishMatch = content.match(
+          /Task id "[^"]+\/(task-\d+)" finished with result:\s*Command exited with code (\d+)/
+        );
+        if (finishMatch) {
+          const taskId = finishMatch[1];
+          const exitCode = Number(finishMatch[2]);
+          const existing = tasksMap.get(taskId);
+          if (existing) {
+            existing.status = exitCode === 0 ? 'done' : 'error';
+            existing.updatedAt = entry.created_at || existing.updatedAt;
+          }
+        }
+      }
+    } catch {
+      // ignore parse errors
+    }
+  }
+
+  // Read task log files from .system_generated/tasks
+  const tasksDir = path.join(brainDir, '.system_generated', 'tasks');
+  if (fs.existsSync(tasksDir)) {
+    try {
+      for (const file of fs.readdirSync(tasksDir)) {
+        if (!file.endsWith('.log')) continue;
+        const taskId = file.replace(/\.log$/, '');
+        const fullPath = path.join(tasksDir, file);
+        const stat = fs.statSync(fullPath);
+        const rawLog = fs.readFileSync(fullPath, 'utf-8');
+        const logTail = cleanTerminalLog(rawLog);
+        const existing = tasksMap.get(taskId);
+        if (existing) {
+          existing.logTail = logTail;
+          existing.updatedAt = stat.mtime.toISOString();
+        } else {
+          tasksMap.set(taskId, {
+            id: taskId,
+            command: taskId,
+            status: 'done',
+            logTail,
+            updatedAt: stat.mtime.toISOString(),
+          });
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // Scan brainDir & brainDir/scratch for generated markdown / code artifacts
+  const artifacts: BrainArtifactItem[] = [];
+  const scanDir = (dir: string, prefix = '') => {
+    if (!fs.existsSync(dir)) return;
+    try {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name.startsWith('.')) continue;
+        const full = path.join(dir, entry.name);
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          if (entry.name === 'scratch') scanDir(full, rel);
+        } else if (entry.isFile() && /\.(md|txt|json|html|sh|py|ts|js)$/i.test(entry.name)) {
+          const stat = fs.statSync(full);
+          const content = fs.readFileSync(full, 'utf-8').slice(0, 25000);
+          artifacts.push({
+            name: entry.name,
+            relativePath: rel,
+            content,
+            sizeBytes: stat.size,
+            updatedAt: stat.mtime.toISOString(),
+          });
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+  scanDir(brainDir);
+
+  return {
+    tasks: Array.from(tasksMap.values()).reverse(),
+    artifacts,
+  };
+}
+
+async function detectRunningDevProcesses(): Promise<RunningProcessItem[]> {
+  try {
+    // Map PID -> listening ports using ss -tulpn
+    const pidPorts = new Map<number, Set<number>>();
+    try {
+      const { stdout: ssOut } = await execAsync('ss -tulpn 2>/dev/null || true');
+      for (const line of ssOut.split('\n')) {
+        if (!line.includes('LISTEN')) continue;
+        const portMatch = line.match(/:(\d+)\s+/);
+        const pidMatches = [...line.matchAll(/pid=(\d+)/g)];
+        if (portMatch && pidMatches.length > 0) {
+          const port = Number(portMatch[1]);
+          for (const pm of pidMatches) {
+            const p = Number(pm[1]);
+            if (!pidPorts.has(p)) pidPorts.set(p, new Set());
+            pidPorts.get(p)!.add(port);
+          }
+        }
+      }
+    } catch {
+      // ignore ss errors
+    }
+
+    const { stdout: psOut } = await execAsync('ps -eo pid,ppid,etimes,args --no-headers');
+    const results: RunningProcessItem[] = [];
+    const selfPid = process.pid;
+    const selfPpid = process.ppid;
+
+    for (const rawLine of psOut.split('\n')) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const m = line.match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      const ppid = Number(m[2]);
+      const elapsedSeconds = Number(m[3]);
+      const cmd = m[4].trim();
+
+      if (pid === selfPid || pid === selfPpid || ppid === selfPid) continue;
+      if (cmd.includes('server/index.ts') && cmd.includes('antigravity-web')) continue;
+
+      const isDevServerOrTask =
+        /\b(npm run|pnpm run|pnpm dev|yarn dev|vite|next dev|next start|tsx watch|nodemon|python3?\s+-m\s+http\.server|flask run|uvicorn|gunicorn|go run|cargo run|bun run|bun dev)\b/i.test(
+          cmd
+        );
+
+      if (!isDevServerOrTask) continue;
+
+      let cwd = '';
+      try {
+        cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+      } catch {
+        cwd = '';
+      }
+
+      const ports = Array.from(pidPorts.get(pid) || []);
+      results.push({
+        pid,
+        command: cmd.slice(0, 180),
+        cwd,
+        elapsedSeconds,
+        ports,
+      });
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+// Get running tasks, artifacts, and dev server processes for a session
+app.get('/api/sessions/:id/artifacts', async (req, res) => {
+  const session = sessions.find((s) => s.id === req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+
+  const { tasks, artifacts } = getConversationTasksAndArtifacts(session.agyConversationId);
+  const processes = await detectRunningDevProcesses();
+
+  res.json({
+    tasks,
+    artifacts,
+    processes,
+  });
+});
+
+// Stop/kill a running background dev server process by PID
+app.post('/api/processes/:pid/kill', (req, res) => {
+  const pid = Number(req.params.pid);
+  if (!pid || pid === process.pid) {
+    return res.status(400).json({ error: 'Invalid PID' });
+  }
+  try {
+    process.kill(pid, 'SIGTERM');
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: String(err) });
+  }
+});
+
 // Live Server & Docker Telemetry
 app.get('/api/system', async (_req, res) => {
   try {
@@ -484,11 +736,55 @@ function readCurrentTurnTranscriptToolCalls(
       lastUserInputIdx >= 0 ? parsedEntries.slice(lastUserInputIdx + 1) : parsedEntries;
 
     const items: ToolCallItem[] = [];
-    for (const entry of relevantEntries) {
+    for (let i = 0; i < relevantEntries.length; i++) {
+      const entry = relevantEntries[i];
       if (typeof entry.step_index === 'number' && entry.step_index <= minStepIndex) {
         continue;
       }
       if (Array.isArray(entry.tool_calls)) {
+        // Look ahead for the corresponding GENERIC output step
+        const nextEntry = relevantEntries[i + 1];
+        const nextContent =
+          nextEntry && nextEntry.type === 'GENERIC' && typeof nextEntry.content === 'string'
+            ? nextEntry.content
+            : typeof entry.content === 'string'
+            ? entry.content
+            : '';
+
+        const bgTaskMatch = nextContent.match(
+          /Tool is running as a background task with task id:\s*[^\s/]+\/(task-\d+)/
+        );
+        const taskId = bgTaskMatch ? bgTaskMatch[1] : undefined;
+
+        let taskLogPreview = '';
+        if (taskId) {
+          const logFile = path.join(
+            AGY_DATA_DIR,
+            'brain',
+            conversationId,
+            '.system_generated',
+            'tasks',
+            `${taskId}.log`
+          );
+          if (fs.existsSync(logFile)) {
+            try {
+              taskLogPreview = cleanTerminalLog(fs.readFileSync(logFile, 'utf-8'), 1500);
+            } catch {
+              // ignore
+            }
+          }
+        }
+
+        // Check if a later SYSTEM_MESSAGE marked this background task as finished
+        let bgFinished = false;
+        if (taskId) {
+          bgFinished = relevantEntries.some(
+            (e) =>
+              typeof e.content === 'string' &&
+              e.content.includes(`/${taskId}" finished with result:`)
+          );
+        }
+
         for (const tc of entry.tool_calls) {
           const name = tc.name || tc.tool_name || 'tool';
           let args = tc.args || tc.arguments || {};
@@ -499,12 +795,19 @@ function readCurrentTurnTranscriptToolCalls(
               args = { raw: args };
             }
           }
+          const isRunning = taskId
+            ? !bgFinished
+            : nextEntry
+            ? nextEntry.status === 'RUNNING'
+            : entry.status !== 'DONE';
+
           items.push({
             id: tc.id || `${entry.step_index || 0}_${name}`,
             name,
             args,
-            status: entry.status === 'DONE' ? 'done' : 'running',
-            output: typeof entry.content === 'string' ? entry.content.slice(0, 1200) : undefined,
+            status: isRunning ? 'running' : 'done',
+            taskId,
+            output: taskLogPreview || (nextContent ? nextContent.slice(0, 1500) : undefined),
           });
         }
       }

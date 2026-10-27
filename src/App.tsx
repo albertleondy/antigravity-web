@@ -37,6 +37,9 @@ import type {
   ToolCallItem,
   SystemTelemetry,
   AgyModelOption,
+  SessionArtifactsResponse,
+  BackgroundTaskItem,
+  BrainArtifactItem,
 } from './types';
 
 import { Button } from '@/components/ui/button';
@@ -237,6 +240,11 @@ const ToolCallsDisplay: React.FC<{ toolCalls: ToolCallItem[] }> = ({ toolCalls }
                   />
                   <Wrench className="size-3.5 text-indigo-400 shrink-0" />
                   <span className="font-mono font-medium text-zinc-200 shrink-0">{tc.name}</span>
+                  {tc.taskId && (
+                    <Badge variant={tc.status === 'running' ? 'warning' : 'secondary'} className="font-mono">
+                      {tc.taskId}
+                    </Badge>
+                  )}
                   {cmdPreview && (
                     <span className="font-mono text-zinc-400 truncate">{String(cmdPreview)}</span>
                   )}
@@ -458,6 +466,16 @@ export function App() {
   const [telemetry, setTelemetry] = useState<SystemTelemetry | null>(null);
   const [loadingTelemetry, setLoadingTelemetry] = useState(false);
 
+  const [sessionArtifacts, setSessionArtifacts] = useState<SessionArtifactsResponse>({
+    tasks: [],
+    artifacts: [],
+    processes: [],
+  });
+  const [selectedTaskModal, setSelectedTaskModal] = useState<BackgroundTaskItem | null>(null);
+  const [selectedArtifactModal, setSelectedArtifactModal] = useState<BrainArtifactItem | null>(
+    null
+  );
+
   // Desktop docked sidebars vs Mobile/Tablet Radix Sheet drawers
   const [desktopLeftOpen, setDesktopLeftOpen] = useState(true);
   const [desktopRightOpen, setDesktopRightOpen] = useState(true);
@@ -543,6 +561,41 @@ export function App() {
       setLoadingTelemetry(false);
     }
   }, [apiFetch]);
+
+  const fetchSessionArtifacts = useCallback(
+    async (sessionId?: string | null) => {
+      const targetId = sessionId ?? activeSessionId;
+      if (!targetId) return;
+      try {
+        const res = await apiFetch(`/api/sessions/${targetId}/artifacts`);
+        if (res.ok) {
+          const data: SessionArtifactsResponse = await res.json();
+          setSessionArtifacts(data);
+          setSelectedTaskModal((prev) =>
+            prev ? data.tasks.find((t) => t.id === prev.id) || prev : null
+          );
+        }
+      } catch {
+        // ignore
+      }
+    },
+    [apiFetch, activeSessionId]
+  );
+
+  const killProcess = useCallback(
+    async (pid: number) => {
+      await apiFetch(`/api/processes/${pid}/kill`, { method: 'POST' });
+      fetchSessionArtifacts();
+    },
+    [apiFetch, fetchSessionArtifacts]
+  );
+
+  useEffect(() => {
+    if (!authenticated || !activeSessionId) return;
+    fetchSessionArtifacts(activeSessionId);
+    const interval = setInterval(() => fetchSessionArtifacts(activeSessionId), 4000);
+    return () => clearInterval(interval);
+  }, [authenticated, activeSessionId, fetchSessionArtifacts]);
 
   const createNewSession = useCallback(async () => {
     const res = await apiFetch('/api/sessions', {
@@ -663,6 +716,7 @@ export function App() {
             })
           );
         } else if (data.type === 'tool_calls_update') {
+          fetchSessionArtifacts(data.sessionId);
           setSessions((prev) =>
             prev.map((s) => {
               if (s.id !== data.sessionId) return s;
@@ -684,6 +738,7 @@ export function App() {
           if (data.type === 'turn_complete' || data.type === 'turn_error') {
             setStreamingSessionId(null);
             fetchTelemetry();
+            fetchSessionArtifacts(data.sessionId);
           }
           setSessions((prev) =>
             prev.map((s) => {
@@ -1365,6 +1420,86 @@ export function App() {
           )}
         </header>
 
+        {/* In-Chat Running Dev Servers, Background Tasks & Brain Artifacts Bar */}
+        {(sessionArtifacts.processes.length > 0 ||
+          sessionArtifacts.tasks.length > 0 ||
+          sessionArtifacts.artifacts.length > 0) && (
+          <div className="shrink-0 border-b border-zinc-800/80 bg-zinc-900/60 px-3 sm:px-4 py-2">
+            <div className="max-w-3xl mx-auto flex items-center gap-2 overflow-x-auto no-scrollbar">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400 shrink-0 flex items-center gap-1">
+                <Activity className="size-3 text-emerald-400" />
+                Running / Artifacts:
+              </span>
+
+              {/* Running Dev Servers / Processes */}
+              {sessionArtifacts.processes.map((proc) => (
+                <div
+                  key={proc.pid}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-950/40 border border-emerald-500/30 text-xs text-emerald-200 shrink-0"
+                >
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+                  <span className="font-mono text-[11px] max-w-[180px] truncate" title={proc.command}>
+                    {proc.command}
+                  </span>
+                  {proc.ports.length > 0 && (
+                    <Badge variant="success" className="font-mono px-1.5 py-0">
+                      :{proc.ports.join(', :')}
+                    </Badge>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => killProcess(proc.pid)}
+                    title={`Stop PID ${proc.pid}`}
+                    className="ml-1 px-1.5 py-0.5 rounded bg-rose-500/20 hover:bg-rose-500/40 text-rose-300 text-[10px] font-medium transition-colors cursor-pointer"
+                  >
+                    Stop
+                  </button>
+                </div>
+              ))}
+
+              {/* Background Tasks from AGY */}
+              {sessionArtifacts.tasks.map((task) => {
+                const isRunning = task.status === 'running';
+                return (
+                  <button
+                    key={task.id}
+                    type="button"
+                    onClick={() => setSelectedTaskModal(task)}
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs shrink-0 transition-colors cursor-pointer ${
+                      isRunning
+                        ? 'bg-amber-950/40 border-amber-500/40 text-amber-200 hover:bg-amber-950/60'
+                        : 'bg-zinc-900 border-zinc-800 text-zinc-300 hover:bg-zinc-800'
+                    }`}
+                  >
+                    <span
+                      className={`w-2 h-2 rounded-full shrink-0 ${
+                        isRunning ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'
+                      }`}
+                    />
+                    <span className="font-mono font-medium text-[11px]">{task.id}</span>
+                    <span className="font-mono text-[11px] text-zinc-400 max-w-[150px] truncate">
+                      {task.command}
+                    </span>
+                  </button>
+                );
+              })}
+
+              {/* Generated Brain Artifacts */}
+              {sessionArtifacts.artifacts.map((art) => (
+                <button
+                  key={art.relativePath}
+                  type="button"
+                  onClick={() => setSelectedArtifactModal(art)}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-950/40 border border-indigo-500/30 hover:bg-indigo-950/60 text-xs text-indigo-200 shrink-0 transition-colors cursor-pointer"
+                >
+                  <FileText className="size-3 text-indigo-400 shrink-0" />
+                  <span className="font-mono text-[11px] max-w-[150px] truncate">{art.name}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Messages Area */}
         <div className="flex-1 overflow-y-auto px-3 sm:px-4 py-4 sm:py-6">
           <div className="max-w-3xl mx-auto space-y-5">
@@ -1574,6 +1709,81 @@ export function App() {
           <DialogFooter>
             <Button type="button" onClick={() => setShowSettingsDialog(false)}>
               Done
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Background Task Live Log Viewer Dialog */}
+      <Dialog
+        open={Boolean(selectedTaskModal)}
+        onOpenChange={(open) => !open && setSelectedTaskModal(null)}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 font-mono">
+              <Terminal className="size-4 text-amber-400" />
+              <span>{selectedTaskModal?.id}</span>
+              <Badge
+                variant={selectedTaskModal?.status === 'running' ? 'warning' : 'success'}
+              >
+                {selectedTaskModal?.status === 'running' ? 'Running' : 'Completed'}
+              </Badge>
+            </DialogTitle>
+            <DialogDescription className="font-mono text-xs break-all">
+              {selectedTaskModal?.command}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3.5 max-h-[60dvh] overflow-y-auto">
+            <pre className="text-xs font-mono text-zinc-200 whitespace-pre-wrap leading-relaxed">
+              {selectedTaskModal?.logTail || 'Waiting for task output...'}
+            </pre>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => fetchSessionArtifacts(activeSessionId)}
+            >
+              <RefreshCw className="size-3.5" />
+              Refresh Log
+            </Button>
+            <Button size="sm" onClick={() => setSelectedTaskModal(null)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Brain Artifact Viewer Dialog */}
+      <Dialog
+        open={Boolean(selectedArtifactModal)}
+        onOpenChange={(open) => !open && setSelectedArtifactModal(null)}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 font-mono">
+              <FileText className="size-4 text-indigo-400" />
+              <span>{selectedArtifactModal?.name}</span>
+            </DialogTitle>
+            <DialogDescription className="font-mono text-xs">
+              {selectedArtifactModal?.relativePath}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 max-h-[65dvh] overflow-y-auto markdown-body text-sm">
+            {selectedArtifactModal?.name.endsWith('.md') ? (
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {selectedArtifactModal.content}
+              </ReactMarkdown>
+            ) : (
+              <pre className="text-xs font-mono text-zinc-200 whitespace-pre-wrap">
+                {selectedArtifactModal?.content}
+              </pre>
+            )}
+          </div>
+          <DialogFooter>
+            <Button size="sm" onClick={() => setSelectedArtifactModal(null)}>
+              Close
             </Button>
           </DialogFooter>
         </DialogContent>
